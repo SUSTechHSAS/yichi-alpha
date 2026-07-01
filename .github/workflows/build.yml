@@ -89,12 +89,14 @@ jobs:
   # Job 2: C++ engine build (LibTorch CPU)
   # ---------------------------------------------------------------------------
   cpp-build:
-    name: C++ engine build (${{ matrix.os }})
+    name: C++ engine (${{ matrix.variant }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-22.04]
+        variant: [cpu]
+        # CUDA build is in cpp-build-cuda job (needs separate setup)
     defaults:
       run:
         working-directory: ./engine
@@ -113,23 +115,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.workspace }}/libtorch
-          key: libtorch-cpu-2.12.1-${{ runner.os }}-${{ matrix.os }}
+          key: libtorch-${{ matrix.variant }}-2.12.1-${{ runner.os }}-${{ matrix.os }}
 
-      - name: Download LibTorch (CPU)
+      - name: Download LibTorch
         if: steps.cache-libtorch.outputs.cache-hit != 'true'
         shell: bash
         run: |
           cd ${{ runner.workspace }}
-          wget -q https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.12.1%2Bcpu.zip
-          unzip -q libtorch-shared-with-deps-2.12.1+cpu.zip -d ${{ runner.workspace }}/
-          rm libtorch-shared-with-deps-2.12.1+cpu.zip
+          wget -q https://download.pytorch.org/libtorch/${{ matrix.variant }}/libtorch-shared-with-deps-2.12.1%2B${{ matrix.variant }}.zip
+          unzip -q libtorch-shared-with-deps-2.12.1+${{ matrix.variant }}.zip -d ${{ runner.workspace }}/
+          rm libtorch-shared-with-deps-2.12.1+${{ matrix.variant }}.zip
           ls ${{ runner.workspace }}/libtorch/
 
-      - name: Configure CMake
+      - name: Configure CMake (with rpath)
         shell: bash
         run: |
-          mkdir -p build
-          cd build
+          mkdir -p build-${{ matrix.variant }}
+          cd build-${{ matrix.variant }}
           cmake -DCMAKE_PREFIX_PATH=${{ runner.workspace }}/libtorch \
                 -DCMAKE_BUILD_TYPE=Release \
                 ..
@@ -137,36 +139,121 @@ jobs:
       - name: Build engine
         shell: bash
         run: |
-          cd build
+          cd build-${{ matrix.variant }}
           make -j$(nproc)
 
-      - name: Verify binary exists
+      - name: Verify rpath is embedded
         shell: bash
         run: |
-          ls -lh build/yichi_selfplay
-          file build/yichi_selfplay
+          echo "Binary RUNPATH (should point to libtorch/lib):"
+          readelf -d build-${{ matrix.variant }}/yichi_selfplay | grep -E "RPATH|RUNPATH" || true
+
+      - name: Verify binary runs WITHOUT LD_LIBRARY_PATH
+        shell: bash
+        run: |
+          # This is the critical test: the libc10.so error happens when rpath
+          # is not set. With our CMakeLists.txt fix, this should work cleanly.
+          env -u LD_LIBRARY_PATH build-${{ matrix.variant }}/yichi_selfplay --help | head -5
 
       - name: "Smoke test: run 1 self-play game with random weights"
         shell: bash
         run: |
           mkdir -p /tmp/yichi_test_output
-          timeout 60 ./build/yichi_selfplay \
+          timeout 60 env -u LD_LIBRARY_PATH ./build-${{ matrix.variant }}/yichi_selfplay \
             --model /dev/null \
             --games 1 \
             --threads 1 \
             --board_size 6 \
             --n_simulations 10 \
+            --device cpu \
             --output /tmp/yichi_test_output 2>&1 | head -30 || true
-          # The --model /dev/null will fail to load (expected), but engine
-          # should still run with random weights and produce output.
           ls -la /tmp/yichi_test_output/ || true
 
       - name: Upload C++ binary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: yichi_selfplay-${{ matrix.os }}
-          path: engine/build/yichi_selfplay
+          name: yichi_selfplay-${{ matrix.variant }}-${{ matrix.os }}
+          path: engine/build-${{ matrix.variant }}/yichi_selfplay
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 2b: C++ engine build with CUDA LibTorch (compile-only, no GPU available on runners)
+  # ---------------------------------------------------------------------------
+  cpp-build-cuda:
+    name: C++ engine (cuda, compile-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true  # CUDA toolkit install can be flaky
+    defaults:
+      run:
+        working-directory: ./engine
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools + CUDA toolkit
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential wget unzip
+          # Install CUDA toolkit (NVIDIA's apt repo)
+          sudo apt-get install -y nvidia-cuda-toolkit || true
+          nvcc --version || true
+
+      - name: Cache LibTorch CUDA
+        id: cache-libtorch-cuda
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.workspace }}/libtorch
+          key: libtorch-cuda-2.12.1-cu121-${{ runner.os }}
+
+      - name: Download LibTorch (CUDA 12.1, ~2.5GB)
+        if: steps.cache-libtorch-cuda.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          cd ${{ runner.workspace }}
+          wget -q https://download.pytorch.org/libtorch/cu121/libtorch-shared-with-deps-2.12.1%2Bcu121.zip
+          unzip -q libtorch-shared-with-deps-2.12.1+cu121.zip -d ${{ runner.workspace }}/
+          rm libtorch-shared-with-deps-2.12.1+cu121.zip
+          ls ${{ runner.workspace }}/libtorch/lib/ | head -10
+
+      - name: Configure CMake (CUDA build)
+        shell: bash
+        run: |
+          mkdir -p build-cuda
+          cd build-cuda
+          cmake -DCMAKE_PREFIX_PATH=${{ runner.workspace }}/libtorch \
+                -DCMAKE_BUILD_TYPE=Release \
+                ..
+          # Verify CUDA was detected
+          grep -i "cuda" CMakeCache.txt || true
+
+      - name: Build engine (CUDA)
+        shell: bash
+        run: |
+          cd build-cuda
+          make -j$(nproc)
+
+      - name: Verify CUDA binary built
+        shell: bash
+        run: |
+          ls -lh build-cuda/yichi_selfplay
+          file build-cuda/yichi_selfplay
+          # Check it links against libtorch_cuda.so
+          ldd build-cuda/yichi_selfplay 2>&1 | grep -i cuda || true
+
+      - name: Verify --help works (rpath test, no GPU needed)
+        shell: bash
+        run: |
+          env -u LD_LIBRARY_PATH build-cuda/yichi_selfplay --help | head -5
+
+      - name: Upload CUDA binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yichi_selfplay-cuda
+          path: engine/build-cuda/yichi_selfplay
           if-no-files-found: warn
           retention-days: 7
 

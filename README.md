@@ -81,18 +81,56 @@ python3 evaluate.py --checkpoint ../checkpoints/model_iter5.pt --games 20
 
 ### 3.2 C++ 引擎（生产部署用）
 
-```bash
-cd engine/
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j
+C++ 引擎同时支持 **CPU 和 CUDA** 构建——同一份源码，用不同的 LibTorch 编译。
 
-# 用 C++ 引擎跑自对弈（速度快 5-10 倍）
-./yichi_selfplay --model ../../checkpoints/model_iter5.pt \
-                 --games 100 \
-                 --board_size 6 \
-                 --output ../selfplay_data/
+#### CPU 构建（默认）
+
+```bash
+# 1. Install LibTorch (CPU version, ~123MB)
+wget https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.12.1%2Bcpu.zip
+unzip libtorch-*.zip -d /opt/libtorch-cpu
+
+# 2. Install CMake (if missing)
+sudo apt install cmake
+
+# 3. Build (rpath is auto-embedded — no LD_LIBRARY_PATH needed)
+./scripts/build_engine.sh cpu
+# or manually:
+cd engine/ && mkdir build-cpu && cd build-cpu
+cmake -DCMAKE_PREFIX_PATH=/opt/libtorch-cpu/libtorch ..
+make -j$(nproc)
+./yichi_selfplay --help    # works directly
 ```
+
+#### CUDA 构建（GPU 加速）
+
+```bash
+# 1. Install NVIDIA CUDA Toolkit 12.1+ (nvcc --version to verify)
+
+# 2. Download LibTorch CUDA version (~2.5GB)
+wget https://download.pytorch.org/libtorch/cu121/libtorch-shared-with-deps-2.12.1%2Bcu121.zip
+unzip libtorch-*.zip -d /opt/libtorch-cuda
+
+# 3. Build (use a SEPARATE build dir — CPU and CUDA caches conflict)
+./scripts/build_engine.sh cuda
+# or manually:
+cd engine/ && mkdir build-cuda && cd build-cuda
+cmake -DCMAKE_PREFIX_PATH=/opt/libtorch-cuda/libtorch ..
+make -j$(nproc)
+
+# 4. Run with CUDA
+./build-cuda/yichi_selfplay --model model.pt --device cuda --games 100
+# or auto-detect (uses CUDA if available, falls back to CPU):
+./build-cuda/yichi_selfplay --model model.pt --device auto --games 100
+```
+
+> **重要**：CPU 和 CUDA 构建必须用**不同的 build 目录**（`build-cpu` vs `build-cuda`），
+> 因为 CMake 在 `CMakeCache.txt` 里缓存了 libtorch 路径，混用会链接错误。
+> `scripts/build_engine.sh` 脚本会自动处理这个分离。
+
+> **rpath 已嵌入**：编译出来的二进制自带 libtorch 库的搜索路径，
+> 不需要 `LD_LIBRARY_PATH`。如果你之前遇到 `libc10.so: cannot open shared object file`，
+> 重新编译即可解决。
 
 ## 4. 核心设计要点速览
 

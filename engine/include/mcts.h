@@ -43,7 +43,8 @@ public:
          int n_simulations = 200,
          float dirichlet_alpha = 0.3f,
          float dirichlet_epsilon = 0.25f,
-         int batch_size = 8);
+         int batch_size = 8,
+         torch::Device device = torch::kCPU);
 
     // Run MCTS from root_state, return root node.
     std::unique_ptr<MCTSNode> search(const Board& root_state, bool add_noise = true);
@@ -65,6 +66,7 @@ private:
     float dirichlet_epsilon_;
     int batch_size_;
     int board_size_;
+    torch::Device device_;   // kCPU or kCUDA
 
     // Batched evaluation queue
     std::vector<MCTSNode*> eval_queue_;
@@ -79,6 +81,7 @@ private:
 
 // Helper: convert Board to network input tensor (perspective-aligned).
 // Output shape: (1, 11, N, N)
-torch::Tensor board_to_tensor(const Board& board);
+// If device is kCUDA, the tensor is moved to GPU.
+torch::Tensor board_to_tensor(const Board& board, torch::Device device = torch::kCPU);
 
 }  // namespace yichi

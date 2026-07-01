@@ -45,25 +45,29 @@ MCTSNode* MCTSNode::best_child(float c_puct) const {
 // MCTS
 // ---------------------------------------------------------------------------
 MCTS::MCTS(YichiNet model, float c_puct, int n_simulations,
-           float dirichlet_alpha, float dirichlet_epsilon, int batch_size)
+           float dirichlet_alpha, float dirichlet_epsilon, int batch_size,
+           torch::Device device)
     : model_(std::move(model)),
       c_puct_(c_puct),
       n_simulations_(n_simulations),
       dirichlet_alpha_(dirichlet_alpha),
       dirichlet_epsilon_(dirichlet_epsilon),
       batch_size_(batch_size),
-      board_size_(0) {
+      board_size_(0),
+      device_(device) {
     // board_size_ will be set per search from root_state
+    // Move model to the target device (CPU or CUDA)
+    model_->to(device_);
 }
 
-torch::Tensor board_to_tensor(const Board& board) {
+torch::Tensor board_to_tensor(const Board& board, torch::Device device) {
     const int N = board.board_size();
     const int p = board.current_player();
     const int opp = (p == 1) ? 2 : 1;
 
-    auto options = torch::TensorOptions().dtype(torch::kFloat32);
+    // Build on CPU first (faster for small tensor initialization)
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
     torch::Tensor planes = torch::zeros({1, 11, N, N}, options);
-
     auto accessor = planes.accessor<float, 4>();
     for (int r = 0; r < N; ++r) {
         for (int c = 0; c < N; ++c) {
@@ -94,6 +98,10 @@ torch::Tensor board_to_tensor(const Board& board) {
         for (int c = 0; c < N; ++c)
             accessor[0][10][r][c] = 1.0f;
 
+    // Move to target device if not CPU
+    if (device.is_cuda()) {
+        planes = planes.to(device);
+    }
     return planes;
 }
 
@@ -159,17 +167,22 @@ void MCTS::evaluate_batch(bool root_add_noise) {
     int n = static_cast<int>(eval_queue_.size());
     if (n == 0) return;
 
-    // Build batched input
+    // Build batched input (on CPU, then move to device_ once)
     std::vector<torch::Tensor> inputs;
     inputs.reserve(n);
     for (int i = 0; i < n; ++i) {
-        inputs.push_back(board_to_tensor(eval_queue_[i]->state));
+        inputs.push_back(board_to_tensor(eval_queue_[i]->state, torch::kCPU));
     }
     torch::Tensor batch = torch::cat(inputs, /*dim=*/0);
+    batch = batch.to(device_);
 
     // Forward
     auto [logits, value] = model_->forward(batch);
     auto policy = torch::softmax(logits, /*dim=*/1);
+
+    // Move outputs to CPU for accessor (works regardless of device)
+    policy = policy.to(torch::kCPU);
+    value = value.to(torch::kCPU);
 
     auto policy_acc = policy.accessor<float, 2>();
     auto value_acc = value.accessor<float, 2>();
@@ -210,9 +223,12 @@ std::unique_ptr<MCTSNode> MCTS::search(const Board& root_state, bool add_noise) 
                                             std::make_pair(-1, -1), 0.0f);
 
     // Evaluate root
-    auto input = board_to_tensor(root->state);
+    auto input = board_to_tensor(root->state, device_);
     auto [logits, value] = model_->forward(input);
     auto policy = torch::softmax(logits, /*dim=*/1);
+    // Move policy back to CPU for accessor (always works regardless of device)
+    policy = policy.to(torch::kCPU);
+    value = value.to(torch::kCPU);
     auto policy_acc = policy.accessor<float, 2>();
     int N = board_size_;
     std::vector<float> p(N * N + 1);

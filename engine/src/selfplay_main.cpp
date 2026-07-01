@@ -49,6 +49,7 @@ struct SelfPlayConfig {
     float dirichlet_epsilon = 0.25f;
     int batch_size = 8;
     std::string output_dir = "./selfplay_data";
+    std::string device = "auto";  // "cpu", "cuda", or "auto" (use CUDA if available)
 };
 
 SelfPlayConfig parse_args(int argc, char** argv) {
@@ -62,7 +63,43 @@ SelfPlayConfig parse_args(int argc, char** argv) {
             }
             return argv[++i];
         };
-        if (a == "--model") cfg.model_path = next();
+        if (a == "--help" || a == "-h") {
+            std::cout
+                << "YichiAlpha C++ self-play driver\n"
+                << "================================\n"
+                << "\n"
+                << "Generates self-play games using MCTS + neural network.\n"
+                << "Output: one .bin file per game with serialized (state, policy, value) samples.\n"
+                << "\n"
+                << "Usage:\n"
+                << "  yichi_selfplay --model <path> [options]\n"
+                << "\n"
+                << "Required:\n"
+                << "  --model <path>        Path to TorchScript model file (.pt, exported via export_for_cpp.py)\n"
+                << "\n"
+                << "Options:\n"
+                << "  --games <N>           Number of self-play games to generate (default: 100)\n"
+                << "  --threads <N>         Number of parallel worker threads (default: 8)\n"
+                << "  --board_size <N>      Board size: 5, 6, or 7 (default: 6)\n"
+                << "  --n_simulations <N>   MCTS simulations per move (default: 400)\n"
+                << "  --c_puct <F>          PUCT exploration constant (default: 1.5)\n"
+                << "  --batch_size <N>      NN batch size for leaf evaluation (default: 8)\n"
+                << "  --output <dir>        Output directory for game .bin files (default: ./selfplay_data)\n"
+                << "  --device <cpu|cuda|auto>  Compute device (default: auto = use CUDA if available)\n"
+                << "\n"
+                << "Examples:\n"
+                << "  # Generate 100 games on 6x6 with 400 MCTS sims each\n"
+                << "  yichi_selfplay --model model.pt --games 100 --threads 8 --output ./data/\n"
+                << "\n"
+                << "  # Quick test: 1 game, 30 sims\n"
+                << "  yichi_selfplay --model model.pt --games 1 --n_simulations 30 --output /tmp/test/\n"
+                << "\n"
+                << "Note: The model file must be in TorchScript format. Convert a Python-trained\n"
+                << "checkpoint with: python/export_for_cpp.py <input.pt> <output_cpp.pt>\n"
+                << std::endl;
+            std::exit(0);
+        }
+        else if (a == "--model") cfg.model_path = next();
         else if (a == "--games") cfg.n_games = atoi(next().c_str());
         else if (a == "--threads") cfg.n_threads = atoi(next().c_str());
         else if (a == "--board_size") cfg.board_size = atoi(next().c_str());
@@ -70,8 +107,10 @@ SelfPlayConfig parse_args(int argc, char** argv) {
         else if (a == "--c_puct") cfg.c_puct = atof(next().c_str());
         else if (a == "--output") cfg.output_dir = next();
         else if (a == "--batch_size") cfg.batch_size = atoi(next().c_str());
+        else if (a == "--device") cfg.device = next();
         else {
             std::cerr << "Unknown arg: " << a << std::endl;
+            std::cerr << "Run with --help for usage." << std::endl;
             std::exit(1);
         }
     }
@@ -140,13 +179,15 @@ std::string board_to_bytes(const Board& b) {
 // ---------------------------------------------------------------------------
 // Self-play one game
 // ---------------------------------------------------------------------------
-GameRecord play_one_game(const SelfPlayConfig& cfg, YichiNet& model, int thread_id, int game_id) {
+GameRecord play_one_game(const SelfPlayConfig& cfg, YichiNet& model,
+                          torch::Device device, int thread_id, int game_id) {
     GameConfig game_cfg;
     game_cfg.board_size = cfg.board_size;
 
     Board board(game_cfg);
     MCTS mcts(model, cfg.c_puct, cfg.n_simulations,
-              cfg.dirichlet_alpha, cfg.dirichlet_epsilon, cfg.batch_size);
+              cfg.dirichlet_alpha, cfg.dirichlet_epsilon, cfg.batch_size,
+              device);
 
     GameRecord record;
     int max_steps = cfg.board_size * cfg.board_size + 5;
@@ -209,6 +250,33 @@ int main(int argc, char** argv) {
     std::cout << "  Board size: " << cfg.board_size << std::endl;
     std::cout << "  MCTS simulations: " << cfg.n_simulations << std::endl;
     std::cout << "  Output dir: " << cfg.output_dir << std::endl;
+    std::cout << "  Device: " << cfg.device << std::endl;
+
+    // Resolve device
+    torch::Device device(torch::kCPU);
+    if (cfg.device == "cuda") {
+        device = torch::Device(torch::kCUDA);
+        if (!torch::cuda::is_available()) {
+            std::cerr << "ERROR: --device cuda but CUDA is not available in this LibTorch build."
+                      << std::endl;
+            std::cerr << "Rebuild with the CUDA version of LibTorch (see scripts/build_engine.sh cuda)."
+                      << std::endl;
+            return 1;
+        }
+        std::cout << "  CUDA available: " << torch::cuda::device_count() << " device(s)" << std::endl;
+    } else if (cfg.device == "auto") {
+        if (torch::cuda::is_available()) {
+            device = torch::Device(torch::kCUDA);
+            std::cout << "  Auto-detected CUDA, using GPU" << std::endl;
+        } else {
+            std::cout << "  Auto-detected CPU (no CUDA available)" << std::endl;
+        }
+    } else if (cfg.device == "cpu") {
+        std::cout << "  Using CPU (forced)" << std::endl;
+    } else {
+        std::cerr << "ERROR: --device must be cpu, cuda, or auto" << std::endl;
+        return 1;
+    }
 
     // Create output dir
     std::string mkdir_cmd = "mkdir -p " + cfg.output_dir;
@@ -261,7 +329,7 @@ int main(int argc, char** argv) {
 
         for (int g = 0; g < games_per_thread; ++g) {
             int game_id = thread_id * 1000 + g;
-            auto record = play_one_game(cfg, model, thread_id, game_id);
+            auto record = play_one_game(cfg, model, device, thread_id, game_id);
 
             std::string path = cfg.output_dir + "/game_" +
                                std::to_string(game_id) + ".bin";
