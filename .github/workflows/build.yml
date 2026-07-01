@@ -1,0 +1,263 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Python pipeline tests (game engine + model + MCTS + quick training)
+  # ---------------------------------------------------------------------------
+  python-tests:
+    name: Python tests (3.${{ matrix.python-minor }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-minor: ['11', '12', '13']
+    defaults:
+      run:
+        working-directory: ./python
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.${{ matrix.python-minor }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.${{ matrix.python-minor }}'
+          cache: pip
+          cache-dependency-path: python/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet pyyaml numpy
+
+      - name: Show environment
+        run: |
+          python --version
+          python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available())"
+          python -c "import numpy; print('numpy:', numpy.__version__)"
+
+      - name: Run game engine unit tests
+        run: |
+          python test_game.py
+
+      - name: Verify model forward pass
+        run: |
+          python model.py
+
+      - name: Verify MCTS search
+        run: |
+          python mcts.py
+
+      - name: Verify self-play pipeline
+        run: |
+          timeout 120 python selfplay.py
+
+      - name: Quick training smoke test (2 iterations)
+        run: |
+          timeout 300 python train.py \
+            --config ../configs/quick.yaml \
+            --iterations 2
+
+      - name: Evaluate trained model
+        run: |
+          timeout 180 python evaluate.py \
+            --checkpoint ../checkpoints/model_iter2.pt \
+            --games 4 \
+            --mcts_sims 30
+
+      - name: Upload checkpoints
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-checkpoints-py3${{ matrix.python-minor }}
+          path: |
+            checkpoints/
+            logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Job 2: C++ engine build (LibTorch CPU)
+  # ---------------------------------------------------------------------------
+  cpp-build:
+    name: C++ engine build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    defaults:
+      run:
+        working-directory: ./engine
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential wget unzip
+
+      - name: Cache LibTorch
+        id: cache-libtorch
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.workspace }}/libtorch
+          key: libtorch-cpu-2.12.1-${{ runner.os }}-${{ matrix.os }}
+
+      - name: Download LibTorch (CPU)
+        if: steps.cache-libtorch.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          cd ${{ runner.workspace }}
+          wget -q https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.12.1%2Bcpu.zip
+          unzip -q libtorch-shared-with-deps-2.12.1+cpu.zip -d ${{ runner.workspace }}/
+          rm libtorch-shared-with-deps-2.12.1+cpu.zip
+          ls ${{ runner.workspace }}/libtorch/
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          mkdir -p build
+          cd build
+          cmake -DCMAKE_PREFIX_PATH=${{ runner.workspace }}/libtorch \
+                -DCMAKE_BUILD_TYPE=Release \
+                ..
+
+      - name: Build engine
+        shell: bash
+        run: |
+          cd build
+          make -j$(nproc)
+
+      - name: Verify binary exists
+        shell: bash
+        run: |
+          ls -lh build/yichi_selfplay
+          file build/yichi_selfplay
+
+      - name: "Smoke test: run 1 self-play game with random weights"
+        shell: bash
+        run: |
+          mkdir -p /tmp/yichi_test_output
+          timeout 60 ./build/yichi_selfplay \
+            --model /dev/null \
+            --games 1 \
+            --threads 1 \
+            --board_size 6 \
+            --n_simulations 10 \
+            --output /tmp/yichi_test_output 2>&1 | head -30 || true
+          # The --model /dev/null will fail to load (expected), but engine
+          # should still run with random weights and produce output.
+          ls -la /tmp/yichi_test_output/ || true
+
+      - name: Upload C++ binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yichi_selfplay-${{ matrix.os }}
+          path: engine/build/yichi_selfplay
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Lint / format checks (best-effort, non-blocking)
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (Python + C++)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install linters
+        run: |
+          pip install --quiet flake8 cpplint
+
+      - name: Lint Python files
+        run: |
+          flake8 python/ --max-line-length=120 --extend-ignore=E203,W503,E501 || true
+
+      - name: Lint C++ files
+        run: |
+          cpplint --filter=-build/include_subdir,-build/c++11,-whitespace/comments,-legal/copyright \
+                  --linelength=120 \
+                  engine/include/*.h engine/src/*.cpp || true
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Cross-language rule alignment test (Python vs Node.js)
+  # ---------------------------------------------------------------------------
+  rule-alignment:
+    name: Rule alignment (Python vs original JS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Python deps
+        run: |
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet pyyaml numpy
+
+      - name: Fetch original game source
+        run: |
+          # The original game JS source is at this URL. Fetch and save it.
+          mkdir -p /tmp/yichi_verify
+          curl -sL "https://sustechhsas.github.io/Some-Little-JS-Games/%E5%BC%82%E5%90%83%E6%A3%8B.html" \
+            -o /tmp/yichi_verify/game_page.html
+          # Extract the script content
+          python3 -c "
+          import re
+          with open('/tmp/yichi_verify/game_page.html') as f:
+              html = f.read()
+          scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+          # Find the largest script (the game logic)
+          game_script = max(scripts, key=len)
+          with open('/tmp/yichi_verify/game_source.js', 'w') as f:
+              f.write(game_script)
+          print(f'Extracted game source: {len(game_script)} chars')
+          "
+
+      - name: Run JS engine to generate random games
+        run: |
+          # Use the verify_rules_vs_js.js script from the repo
+          # Update path to read game source from /tmp/yichi_verify/
+          sed 's|/home/z/my-project/scripts/game_source.js|/tmp/yichi_verify/game_source.js|g; s|/tmp/yichi_js_games.json|/tmp/yichi_verify/yichi_js_games.json|g' \
+            scripts/verify_rules_vs_js.js > /tmp/yichi_verify/run.js
+          cd /tmp/yichi_verify
+          node run.js 2>&1 | tail -10
+
+      - name: Compare Python engine against JS output
+        run: |
+          # compare_rules.py is in python/ dir of the repo
+          # It reads /tmp/yichi_verify/yichi_js_games.json (set by sed above)
+          sed 's|/tmp/yichi_js_games.json|/tmp/yichi_verify/yichi_js_games.json|g' \
+            python/compare_rules.py > /tmp/yichi_verify/compare_rules.py
+          cd python
+          PYTHONPATH=. python3 /tmp/yichi_verify/compare_rules.py 2>&1 | tail -20

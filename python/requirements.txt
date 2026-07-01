@@ -1,0 +1,7 @@
+# YichiAlpha — Python dependencies
+# Install: pip install -r requirements.txt
+# Note: torch is installed separately via --index-url for CPU-only build
+
+torch>=2.0
+numpy>=1.20
+pyyaml>=6.0

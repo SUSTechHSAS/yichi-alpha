@@ -1,5 +1,10 @@
 # 异吃棋 AlphaZero 训练框架 (YichiAlpha)
 
+[![Build & Test](https://github.com/SUSTechHSAS/yichi-alpha/actions/workflows/build.yml/badge.svg)](https://github.com/SUSTechHSAS/yichi-alpha/actions/workflows/build.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![C%2B%2B](https://img.shields.io/badge/C%2B%2B-17-orange.svg)](https://en.cppreference.com/)
+
 > 借鉴 KataGo / AlphaZero 训练范式，为"异吃棋"游戏从零搭建的神经网络 + MCTS + 自对弈强化学习框架。
 >
 > Game source: https://sustechhsas.github.io/Some-Little-JS-Games/异吃棋.html
