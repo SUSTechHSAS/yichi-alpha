@@ -39,56 +39,80 @@ from evaluate import RandomAgent
 
 
 # ---------------------------------------------------------------------------
-# Display
+# Display — fixed-width cells using Unicode box drawing
 # ---------------------------------------------------------------------------
+# Each cell is rendered as a 4-char-wide block so columns always align:
+#   棋子: " x₂ " / " x₉ " / " o₃ "  (color + subscript health)
+#   障碍: " ▓▓ " / " ░░ "
+#   空格: " ·  " / " C3 "  (show coordinate hint on empty cells, optional)
+#
+# Subscript digits for health (avoids width variation 1 vs 2 digits)
+SUBSCRIPT = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+
 PLAYER_LABEL = {X: 'X (橙)', O: 'O (蓝)'}
 PLAYER_SHORT = {X: 'X', O: 'O'}
 
 
-def render_board(state: GameState, last_move=None, highlight_legal=False):
-    """Render the board as ASCII art with coordinates."""
+def _render_cell(t: int, h: int, r: int, c: int, n: int,
+                  last_move: bool, show_coords: bool) -> str:
+    """Render one cell as exactly 4 characters (fixed width)."""
+    if t == X:
+        # X piece with subscript health
+        inner = f"x{str(h).translate(SUBSCRIPT)}"
+        marker = "▶" if last_move else " "
+        return f"{marker}{inner} "
+    elif t == O:
+        inner = f"o{str(h).translate(SUBSCRIPT)}"
+        marker = "▶" if last_move else " "
+        return f"{marker}{inner} "
+    elif t == BLOCK:
+        return " ▓▓ "  # block cell
+    else:
+        # Empty cell — optionally show coordinate
+        if show_coords:
+            coord = f"{chr(ord('a') + c)}{r+1}"
+            return f" {coord} "
+        else:
+            return " ·  "
+
+
+def render_board(state: GameState, last_move=None, show_coords: bool = True):
+    """Render the board with proper alignment using fixed-width cells."""
     n = state.board_size
     print()
     # Column header
-    print("    " + "  ".join(chr(ord('A') + c) for c in range(n)) + "  ")
-    print("   +" + "---+" * n)
-
-    legal_set = set(state.legal_moves()) if highlight_legal else set()
+    col_header = "     " + "   ".join(chr(ord('A') + c) for c in range(n))
+    print(col_header)
+    # Top border
+    print("    ┌" + "────┬" * (n - 1) + "────┐")
 
     for r in range(n):
-        row_label = f"{r+1:>2}"
+        # Row label (right-aligned to 2 chars)
+        row_label = f"{r+1:>2} "
         cells = []
         for c in range(n):
             t = int(state.types[r, c])
             h = int(state.health[r, c])
-            ch = CELL_CHARS[t]
-            if t in (X, O):
-                cell = f"{ch}{h}"
-            elif t == BLOCK:
-                cell = " # "
-            else:
-                # Empty cell
-                if (r, c) in legal_set:
-                    coord = f"{chr(ord('A') + c)}{r+1}"
-                    cell = f"·{coord[-1]}·"[:3] if len(coord) == 2 else " · "
-                    # Simpler: just show a dot
-                    cell = " · "
-                else:
-                    cell = " · "
-            # Highlight last move with brackets
-            if last_move and (r, c) == last_move:
-                cell = f"[{ch}{h}]" if t in (X, O) else f"[{cell.strip()}]"
-                # Actually just mark with parens for clarity
-                cell = f"({ch}{h})" if t in (X, O) else cell
-            cells.append(cell)
-        print(f"{row_label} |" + "|".join(cells) + "|")
-        print("   +" + "---+" * n)
+            is_last = (last_move is not None and r == last_move[0] and c == last_move[1])
+            cells.append(_render_cell(t, h, r, c, n, is_last, show_coords))
+        # Join with vertical bars
+        print(row_label + "│" + "│".join(cells) + "│")
+        # Row separator
+        if r < n - 1:
+            print("    ├" + "────┼" * (n - 1) + "────┤")
 
+    # Bottom border
+    print("    └" + "────┴" * (n - 1) + "────┘")
     print()
-    print(f"  当前轮到: {PLAYER_LABEL[state.current_player]}    步数: {state.step}")
+
+    # Status line
     x_count = int((state.types == X).sum())
     o_count = int((state.types == O).sum())
-    print(f"  棋子数: X={x_count}  O={o_count}")
+    print(f"  轮到: {PLAYER_LABEL[state.current_player]}   步数: {state.step}   "
+          f"棋子: X={x_count} O={o_count}")
+    if last_move:
+        coord = f"{chr(ord('A') + last_move[1])}{last_move[0]+1}"
+        print(f"  上一步: {coord}")
     print()
 
 
@@ -197,10 +221,12 @@ def play_game(args):
                           show_thinking=args.show_thinking)
 
     history = []  # for undo
+    last_move = None  # track last move for highlighting
 
     # Game loop
     while not state.is_terminal():
-        render_board(state, highlight_legal=False)
+        render_board(state, last_move=last_move, show_coords=not args.no_coords)
+        last_move = None  # only highlight once
 
         current = state.current_player
         if current == human_side:
@@ -244,6 +270,7 @@ def play_game(args):
                 # Apply move
                 history.append(state.clone())
                 state.apply_move(move)
+                last_move = move
                 print(f"\n  你落子: {chr(ord('A') + move[1])}{move[0]+1}")
                 break
         else:
@@ -255,10 +282,11 @@ def play_game(args):
                 break
             history.append(state.clone())
             state.apply_move(move)
+            last_move = move
             print(f"  AI 落子: {chr(ord('A') + move[1])}{move[0]+1}")
 
     # Game over
-    render_board(state)
+    render_board(state, last_move=last_move, show_coords=not args.no_coords)
     x_count = int((state.types == X).sum())
     o_count = int((state.types == O).sum())
     winner = state.winner()
@@ -306,6 +334,8 @@ def main():
                         help='AI 用随机策略 (不用模型)')
     parser.add_argument('--no-thinking', action='store_true',
                         help='不显示 AI 思考过程')
+    parser.add_argument('--no-coords', action='store_true',
+                        help='不显示空格上的坐标提示 (更简洁的棋盘)')
     args = parser.parse_args()
 
     args.show_thinking = not args.no_thinking
