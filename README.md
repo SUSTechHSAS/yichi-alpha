@@ -87,7 +87,52 @@ python evaluate.py --checkpoint ../checkpoints/model_iter3.pt --games 10 --mcts_
 
 ## 🎮 怎么用训练好的 AI？
 
-### 方式 A：在 Python 里调用
+### 方式 A：和 AI 对战（最有趣！）
+
+```bash
+cd python/
+
+# 你执 X（先手），AI 执 O，用训练好的模型
+python play.py
+
+# 你执 O（后手），AI 先手
+python play.py --side o
+
+# AI 更强（更多 MCTS 模拟，但更慢）
+python play.py --sims 200
+
+# AI 最弱（随机策略，适合新手）
+python play.py --random
+```
+
+**游戏界面**：
+```
+    A  B  C  D  E  F
+   +---+---+---+---+---+---+
+ 1 | · | · | · | · | · | · |
+   +---+---+---+---+---+---+
+ 2 | · | · | · | · | · | · |
+   +---+---+---+---+---+---+
+ 3 | · | · |x2| · | · | · |
+   +---+---+---+---+---+---+
+ 4 | · | · | · | · |o2| · |
+   +---+---+---+---+---+---+
+ 5 | · | · | · | · | · | · |
+   +---+---+---+---+---+---+
+ 6 | · | · | · | · | · | · |
+   +---+---+---+---+---+---+
+
+  当前轮到: X (橙)    步数: 2
+  你的回合 (X) — 输入坐标 (如 C3):
+```
+
+- 输入坐标如 `C3` 落子（列字母 + 行号）
+- 输入 `moves` 查看所有合法落子点
+- 输入 `undo` 悔棋一步
+- 输入 `quit` 退出
+- AI 会显示候选落子和局面评估
+
+### 方式 B：在 Python 代码里调用
 
 ```python
 import sys
@@ -113,7 +158,7 @@ state.apply_move(move)
 print(state)
 ```
 
-### 方式 B：用 C++ 引擎（更快，生产部署用）
+### 方式 C：用 C++ 引擎（更快，生产部署用）
 
 见下方 [C++ 引擎](#-c-引擎可选更快) 章节。
 
@@ -253,6 +298,7 @@ yichi-alpha/
 │   ├── mcts.py                    #   MCTS 搜索
 │   ├── selfplay.py                #   自对弈数据生成
 │   ├── train.py                   #   训练主循环 ← 入口
+│   ├── play.py                    #   人机对战 ← 和 AI 下棋
 │   ├── evaluate.py                #   评估脚本
 │   ├── export_for_cpp.py          #   把模型转成 C++ 能读的格式
 │   └── requirements.txt           #   Python 依赖
@@ -294,6 +340,9 @@ yichi-alpha/
 
 | 我想... | 命令 |
 |---|---|
+| **和 AI 下棋** | `cd python && python play.py` |
+| **和 AI 下棋（你执后手）** | `cd python && python play.py --side o` |
+| **和随机策略下棋（最弱）** | `cd python && python play.py --random` |
 | 跑通一次训练验证 pipeline | `cd python && python train.py --config ../configs/quick.yaml --iterations 3` |
 | 评估模型 vs 随机 | `cd python && python evaluate.py --checkpoint ../checkpoints/model_iter3.pt --games 20 --mcts_sims 50` |
 | 看模型在下哪一步 | `cd python && python debug_predict.py` |
