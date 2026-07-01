@@ -43,6 +43,7 @@ from mcts import MCTS
 from dataset import ReplayBuffer
 from selfplay import self_play_game, self_play_random_baseline
 from evaluate import MCTSAgent, RandomAgent, play_match
+from load_cpp_data import load_cpp_selfplay_dir
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +95,13 @@ class TrainConfig:
     log_dir: str = "../logs"
     device: str = "cpu"
     seed: int = 42
+
+    # C++ data loading (optional — if set, skip Python self-play and train from C++ data)
+    # Set this to a directory containing game_*.bin files produced by yichi_selfplay.
+    # The training loop will load ALL .bin files at startup, then train without self-play.
+    # Use this for distributed training: C++ engine generates data, Python trains.
+    cpp_data_dir: str = ""       # empty = use Python self-play (default)
+    cpp_data_refresh: bool = False  # if True, re-scan cpp_data_dir every iteration
 
     @classmethod
     def from_yaml(cls, path: str) -> 'TrainConfig':
@@ -241,28 +249,60 @@ def train(config: TrainConfig, logger: Optional[Logger] = None):
                     extra={"iter": 0, "config": asdict(config)})
     logger.log(f"Saved initial model to {ckpt_dir / 'model_iter0.pt'}")
 
+    # ----- Optional: preload C++ self-play data -----
+    use_cpp_data = bool(config.cpp_data_dir)
+    if use_cpp_data:
+        logger.log(f"Loading C++ self-play data from {config.cpp_data_dir}...")
+        cpp_samples = load_cpp_selfplay_dir(config.cpp_data_dir, verbose=True)
+        buffer.push(cpp_samples)
+        logger.log(f"C++ data loaded: {len(cpp_samples)} samples, buffer size = {len(buffer)}")
+        if len(cpp_samples) == 0:
+            logger.log("WARNING: no C++ data found, falling back to Python self-play")
+            use_cpp_data = False
+
     # ----- Main loop -----
     for iteration in range(1, config.iterations + 1):
         iter_t0 = time.time()
 
-        # --- 1. Self-play ---
-        model.eval()
-        rng = np.random.default_rng(config.seed + iteration)
-        all_samples = []
-        sp_t0 = time.time()
-        for g in range(config.selfplay_games_per_iter):
-            samples = self_play_game(model, mcts, game_cfg, rng=rng)
-            all_samples.extend(samples)
-        sp_dt = time.time() - sp_t0
-        buffer.push(all_samples)
-        logger.log(
-            f"Iter {iteration}: self-play generated {len(all_samples)} samples "
-            f"({config.selfplay_games_per_iter} games, {sp_dt:.1f}s), "
-            f"buffer size = {len(buffer)}",
-            extra={"iter": iteration, "phase": "selfplay",
-                   "n_samples": len(all_samples), "buffer_size": len(buffer),
-                   "selfplay_time": sp_dt}
-        )
+        # --- 1. Self-play (skip if using C++ data) ---
+        if use_cpp_data:
+            if config.cpp_data_refresh:
+                # Re-scan directory for new games (for ongoing C++ generation)
+                new_samples = load_cpp_selfplay_dir(
+                    config.cpp_data_dir, verbose=False
+                )
+                buffer.push(new_samples)
+                logger.log(
+                    f"Iter {iteration}: refreshed {len(new_samples)} C++ samples, "
+                    f"buffer size = {len(buffer)}",
+                    extra={"iter": iteration, "phase": "cpp_data_load",
+                           "n_samples": len(new_samples), "buffer_size": len(buffer)}
+                )
+            else:
+                logger.log(
+                    f"Iter {iteration}: using preloaded C++ data (buffer size = {len(buffer)})",
+                    extra={"iter": iteration, "phase": "cpp_data_skip",
+                           "buffer_size": len(buffer)}
+                )
+        else:
+            # Python self-play (original path)
+            model.eval()
+            rng = np.random.default_rng(config.seed + iteration)
+            all_samples = []
+            sp_t0 = time.time()
+            for g in range(config.selfplay_games_per_iter):
+                samples = self_play_game(model, mcts, game_cfg, rng=rng)
+                all_samples.extend(samples)
+            sp_dt = time.time() - sp_t0
+            buffer.push(all_samples)
+            logger.log(
+                f"Iter {iteration}: self-play generated {len(all_samples)} samples "
+                f"({config.selfplay_games_per_iter} games, {sp_dt:.1f}s), "
+                f"buffer size = {len(buffer)}",
+                extra={"iter": iteration, "phase": "selfplay",
+                       "n_samples": len(all_samples), "buffer_size": len(buffer),
+                       "selfplay_time": sp_dt}
+            )
 
         # --- 2. Training ---
         model.train()
@@ -399,13 +439,33 @@ def train(config: TrainConfig, logger: Optional[Logger] = None):
 # CLI
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="YichiAlpha training")
+    parser = argparse.ArgumentParser(
+        description="YichiAlpha training",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Standard training (Python self-play + train)
+  python train.py --config ../configs/quick.yaml --iterations 5
+
+  # Train from C++ self-play data (no Python self-play — much faster)
+  # First generate data with: ./yichi_selfplay --model model.pt --output ./data/
+  python train.py --config ../configs/quick.yaml --data_dir ./data/ --iterations 20
+
+  # Train on GPU
+  python train.py --config ../configs/default.yaml --device cuda --iterations 100
+        """
+    )
     parser.add_argument('--config', type=str, default='../configs/default.yaml',
                         help='Path to YAML config file')
     parser.add_argument('--iterations', type=int, default=None,
                         help='Override iterations count')
     parser.add_argument('--device', type=str, default=None,
                         help='Override device (cpu/cuda)')
+    parser.add_argument('--data_dir', type=str, default=None,
+                        help='Directory of C++ self-play .bin files. If set, '
+                             'skip Python self-play and train only from this data.')
+    parser.add_argument('--data_refresh', action='store_true',
+                        help='Re-scan --data_dir every iteration (for ongoing C++ generation)')
     args = parser.parse_args()
 
     config = TrainConfig.from_yaml(args.config)
@@ -413,6 +473,10 @@ def main():
         config.iterations = args.iterations
     if args.device is not None:
         config.device = args.device
+    if args.data_dir is not None:
+        config.cpp_data_dir = args.data_dir
+    if args.data_refresh:
+        config.cpp_data_refresh = True
 
     log_dir = Path(config.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
