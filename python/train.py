@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
+import multiprocessing as mp
 
 # Add this file's directory to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -102,6 +103,12 @@ class TrainConfig:
     # Use this for distributed training: C++ engine generates data, Python trains.
     cpp_data_dir: str = ""       # empty = use Python self-play (default)
     cpp_data_refresh: bool = False  # if True, re-scan cpp_data_dir every iteration
+
+    # Async evaluation (recommended for CPU — speeds up training 3-5x)
+    # When True, eval and Arena run in a forked subprocess that doesn't block training.
+    # Results are written to eval_result_iter{N}.json and read back next iteration.
+    async_eval: bool = True
+    eval_n_games: int = 8        # games for vs-random eval (per iter)
 
     @classmethod
     def from_yaml(cls, path: str) -> 'TrainConfig':
@@ -181,6 +188,122 @@ class Logger:
 
 
 # ---------------------------------------------------------------------------
+# Async evaluation worker (runs in a forked subprocess)
+# ---------------------------------------------------------------------------
+def _eval_worker(model_path: str, best_model_path: str, config_dict: dict,
+                  result_path: str, iteration: int, do_arena: bool):
+    """Subprocess: load model from file, run eval + optional Arena, write result JSON.
+
+    This runs in a forked process so it doesn't block training.
+    Reads model from disk (no shared memory with trainer).
+    """
+    # Rebuild config from dict
+    cfg = TrainConfig(**config_dict)
+    game_cfg = GameConfig(
+        board_size=cfg.board_size, initial_health=cfg.initial_health,
+        attack_power=cfg.attack_power, heal_power=cfg.heal_power,
+        diag_heal=cfg.diag_heal, diag_attack=cfg.diag_attack,
+    )
+
+    result = {"iter": iteration, "vs_random": None, "arena": None}
+
+    try:
+        model = load_checkpoint(model_path, device=cfg.device)
+        model_agent = MCTSAgent(
+            model, n_simulations=cfg.n_simulations_eval,
+            temperature=0.0, device=cfg.device,
+        )
+        rng = np.random.default_rng(cfg.seed + 9999 + iteration)
+        random_agent = RandomAgent(rng=rng)
+
+        # vs random
+        n_games = cfg.eval_n_games
+        wins = losses_n = draws = 0
+        for g in range(n_games):
+            if g % 2 == 0:
+                w = play_match(model_agent, random_agent, game_cfg)
+                if w == X: wins += 1
+                elif w == O: losses_n += 1
+                else: draws += 1
+            else:
+                w = play_match(random_agent, model_agent, game_cfg)
+                if w == O: wins += 1
+                elif w == X: losses_n += 1
+                else: draws += 1
+        result["vs_random"] = {
+            "wins": wins, "losses": losses_n, "draws": draws,
+            "n_games": n_games, "win_rate": wins / n_games,
+        }
+
+        # Arena: new vs best
+        if do_arena and Path(best_model_path).exists():
+            best_model = load_checkpoint(best_model_path, device=cfg.device)
+            best_agent = MCTSAgent(
+                best_model, n_simulations=cfg.n_simulations_eval,
+                temperature=0.0, device=cfg.device,
+            )
+            a_wins = b_wins = a_draws = 0
+            for g in range(cfg.arena_games):
+                if g % 2 == 0:
+                    w = play_match(model_agent, best_agent, game_cfg)
+                    if w == X: a_wins += 1
+                    elif w == O: b_wins += 1
+                    else: a_draws += 1
+                else:
+                    w = play_match(best_agent, model_agent, game_cfg)
+                    if w == O: a_wins += 1
+                    elif w == X: b_wins += 1
+                    else: a_draws += 1
+            new_wr = a_wins / cfg.arena_games
+            result["arena"] = {
+                "new_wins": a_wins, "best_wins": b_wins, "draws": a_draws,
+                "n_games": cfg.arena_games, "new_win_rate": new_wr,
+                "new_is_better": new_wr > cfg.win_rate_threshold,
+            }
+    except Exception as e:
+        result["error"] = str(e)
+
+    with open(result_path, 'w') as f:
+        json.dump(result, f, indent=2)
+
+
+def _check_pending_evals(eval_dir: Path, logger: Logger):
+    """Check for completed async eval result files and log them."""
+    for result_file in sorted(eval_dir.glob("eval_result_iter*.json")):
+        try:
+            with open(result_file) as f:
+                result = json.load(f)
+            iter_num = result["iter"]
+            # Check if we already logged this one (file has .logged marker)
+            marker = result_file.with_suffix('.logged')
+            if marker.exists():
+                continue
+
+            if result.get("vs_random"):
+                vr = result["vs_random"]
+                logger.log(
+                    f"  [async eval] Iter {iter_num} vs random: "
+                    f"{vr['wins']}/{vr['n_games']} ({vr['win_rate']:.1%}), "
+                    f"{vr['losses']} losses, {vr['draws']} draws",
+                    extra={"iter": iter_num, "phase": "async_eval",
+                           **{f"vs_random_{k}": v for k, v in vr.items()}}
+                )
+            if result.get("arena"):
+                ar = result["arena"]
+                logger.log(
+                    f"  [async arena] Iter {iter_num}: new vs best "
+                    f"{ar['new_wins']}/{ar['n_games']} ({ar['new_win_rate']:.1%})",
+                    extra={"iter": iter_num, "phase": "async_arena",
+                           **{f"arena_{k}": v for k, v in ar.items()}}
+                )
+            marker.touch()
+            # Optionally delete the result file
+            # result_file.unlink()
+        except Exception as e:
+            logger.log(f"  [async eval] failed to read {result_file}: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 def train(config: TrainConfig, logger: Optional[Logger] = None):
@@ -230,6 +353,17 @@ def train(config: TrainConfig, logger: Optional[Logger] = None):
     # Checkpoint dir
     ckpt_dir = Path(config.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # Eval dir (for async eval result files)
+    eval_dir = Path(config.log_dir) / "eval_results"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+
+    # Use 'spawn' for multiprocessing to avoid issues with CUDA/fork
+    if config.async_eval:
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass  # already set
 
     # ----- Cold start: bootstrap buffer with random games -----
     if config.cold_start_random_games > 0:
@@ -348,84 +482,131 @@ def train(config: TrainConfig, logger: Optional[Logger] = None):
                         extra={"iter": iteration, "config": asdict(config)})
         logger.log(f"Iter {iteration}: saved checkpoint to {ckpt_path}")
 
-        # --- 4. Evaluate against random baseline every iteration (cheap) ---
-        eval_t0 = time.time()
-        n_eval_games = min(8, config.arena_games)  # small for speed
-        wins = 0
-        losses_n = 0
-        draws = 0
-        rng_eval = np.random.default_rng(config.seed + 9999 + iteration)
-        random_agent = RandomAgent(rng=rng_eval)
-        model_agent = MCTSAgent(
-            model, n_simulations=config.n_simulations_eval,
-            temperature=0.0, device=config.device,
-        )
-        for g in range(n_eval_games):
-            if g % 2 == 0:
-                w = play_match(model_agent, random_agent, game_cfg)
-                if w == X: wins += 1
-                elif w == O: losses_n += 1
-                else: draws += 1
-            else:
-                w = play_match(random_agent, model_agent, game_cfg)
-                if w == O: wins += 1
-                elif w == X: losses_n += 1
-                else: draws += 1
-        eval_dt = time.time() - eval_t0
-        win_rate = wins / n_eval_games
-        logger.log(
-            f"Iter {iteration}: eval vs random: {wins}/{n_eval_games} wins "
-            f"({win_rate:.1%}), {losses_n} losses, {draws} draws ({eval_dt:.1f}s)",
-            extra={"iter": iteration, "phase": "eval",
-                   "win_rate": win_rate, "wins": wins, "losses": losses_n,
-                   "draws": draws, "eval_time": eval_dt}
-        )
+        # --- 4. Evaluation (async or sync) ---
+        # Check for any completed async evals from previous iterations
+        if config.async_eval:
+            _check_pending_evals(eval_dir, logger)
 
-        # --- 5. Arena: new model vs best model every eval_every iters ---
-        if iteration % config.eval_every == 0 and iteration > 0:
-            arena_t0 = time.time()
-            best_path = ckpt_dir / "model_best.pt"
-            if best_path.exists():
-                best_model = load_checkpoint(str(best_path), device=config.device)
-                best_agent = MCTSAgent(
-                    best_model, n_simulations=config.n_simulations_eval,
-                    temperature=0.0, device=config.device,
-                )
-                a_wins = 0
-                b_wins = 0
-                a_draws = 0
-                rng_arena = np.random.default_rng(config.seed + 7777 + iteration)
-                for g in range(config.arena_games):
-                    if g % 2 == 0:
-                        w = play_match(model_agent, best_agent, game_cfg)
-                        if w == X: a_wins += 1
-                        elif w == O: b_wins += 1
-                        else: a_draws += 1
-                    else:
-                        w = play_match(best_agent, model_agent, game_cfg)
-                        if w == O: a_wins += 1
-                        elif w == X: b_wins += 1
-                        else: a_draws += 1
-                arena_dt = time.time() - arena_t0
-                new_win_rate = a_wins / config.arena_games
-                logger.log(
-                    f"Iter {iteration}: ARENA new vs best: {a_wins}/{config.arena_games} "
-                    f"({new_win_rate:.1%}), {b_wins} losses, {a_draws} draws ({arena_dt:.1f}s)",
-                    extra={"iter": iteration, "phase": "arena",
-                           "new_win_rate": new_win_rate, "a_wins": a_wins,
-                           "b_wins": b_wins, "draws": a_draws, "arena_time": arena_dt}
-                )
-                if new_win_rate > config.win_rate_threshold:
+        do_arena = (iteration % config.eval_every == 0 and iteration > 0)
+
+        if config.async_eval:
+            # Fork a subprocess to run eval + arena; don't block training
+            result_path = eval_dir / f"eval_result_iter{iteration}.json"
+            # Clean up any stale marker
+            marker = result_path.with_suffix('.logged')
+            if marker.exists():
+                marker.unlink()
+            if result_path.exists():
+                result_path.unlink()
+
+            best_path_str = str(ckpt_dir / "model_best.pt")
+            config_dict = asdict(config)
+
+            proc = mp.Process(
+                target=_eval_worker,
+                args=(str(ckpt_path), best_path_str, config_dict,
+                      str(result_path), iteration, do_arena),
+                daemon=True,
+            )
+            proc.start()
+            logger.log(
+                f"Iter {iteration}: async eval forked (PID {proc.pid}), "
+                f"result will appear as [async eval] when done",
+                extra={"iter": iteration, "phase": "async_eval_fork",
+                       "pid": proc.pid}
+            )
+            # Don't join — let it run in background
+        else:
+            # Synchronous eval (original behavior, blocks training)
+            eval_t0 = time.time()
+            n_eval_games = config.eval_n_games
+            wins = losses_n = draws = 0
+            rng_eval = np.random.default_rng(config.seed + 9999 + iteration)
+            random_agent = RandomAgent(rng=rng_eval)
+            model_agent = MCTSAgent(
+                model, n_simulations=config.n_simulations_eval,
+                temperature=0.0, device=config.device,
+            )
+            for g in range(n_eval_games):
+                if g % 2 == 0:
+                    w = play_match(model_agent, random_agent, game_cfg)
+                    if w == X: wins += 1
+                    elif w == O: losses_n += 1
+                    else: draws += 1
+                else:
+                    w = play_match(random_agent, model_agent, game_cfg)
+                    if w == O: wins += 1
+                    elif w == X: losses_n += 1
+                    else: draws += 1
+            eval_dt = time.time() - eval_t0
+            win_rate = wins / n_eval_games
+            logger.log(
+                f"Iter {iteration}: eval vs random: {wins}/{n_eval_games} wins "
+                f"({win_rate:.1%}), {losses_n} losses, {draws} draws ({eval_dt:.1f}s)",
+                extra={"iter": iteration, "phase": "eval",
+                       "win_rate": win_rate, "wins": wins, "losses": losses_n,
+                       "draws": draws, "eval_time": eval_dt}
+            )
+
+            # Arena (sync)
+            if do_arena:
+                arena_t0 = time.time()
+                best_path = ckpt_dir / "model_best.pt"
+                if best_path.exists():
+                    best_model = load_checkpoint(str(best_path), device=config.device)
+                    best_agent = MCTSAgent(
+                        best_model, n_simulations=config.n_simulations_eval,
+                        temperature=0.0, device=config.device,
+                    )
+                    a_wins = b_wins = a_draws = 0
+                    for g in range(config.arena_games):
+                        if g % 2 == 0:
+                            w = play_match(model_agent, best_agent, game_cfg)
+                            if w == X: a_wins += 1
+                            elif w == O: b_wins += 1
+                            else: a_draws += 1
+                        else:
+                            w = play_match(best_agent, model_agent, game_cfg)
+                            if w == O: a_wins += 1
+                            elif w == X: b_wins += 1
+                            else: a_draws += 1
+                    arena_dt = time.time() - arena_t0
+                    new_win_rate = a_wins / config.arena_games
+                    logger.log(
+                        f"Iter {iteration}: ARENA new vs best: {a_wins}/{config.arena_games} "
+                        f"({new_win_rate:.1%}), {b_wins} losses, {a_draws} draws ({arena_dt:.1f}s)",
+                        extra={"iter": iteration, "phase": "arena",
+                               "new_win_rate": new_win_rate, "a_wins": a_wins,
+                               "b_wins": b_wins, "draws": a_draws, "arena_time": arena_dt}
+                    )
+                    if new_win_rate > config.win_rate_threshold:
+                        save_checkpoint(model, str(best_path),
+                                        extra={"iter": iteration, "config": asdict(config)})
+                        logger.log(f"Iter {iteration}: NEW BEST MODEL saved")
+                else:
                     save_checkpoint(model, str(best_path),
                                     extra={"iter": iteration, "config": asdict(config)})
-                    logger.log(f"Iter {iteration}: NEW BEST MODEL saved (win rate {new_win_rate:.1%} > {config.win_rate_threshold:.0%})")
-            else:
-                # No best yet, save current as best
-                save_checkpoint(model, str(best_path),
-                                extra={"iter": iteration, "config": asdict(config)})
 
         iter_dt = time.time() - iter_t0
         logger.log(f"Iter {iteration}: total time {iter_dt:.1f}s")
+
+    # --- After loop: wait for any remaining async evals and log them ---
+    if config.async_eval:
+        logger.log("Waiting for remaining async evals to finish...")
+        # Give them up to 5 minutes
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            _check_pending_evals(eval_dir, logger)
+            # Check if any unlogged results remain
+            pending = [f for f in eval_dir.glob("eval_result_iter*.json")
+                       if not f.with_suffix('.logged').exists()]
+            if not pending:
+                break
+            time.sleep(5)
+        _check_pending_evals(eval_dir, logger)
+
+        # Promote best model based on async arena results
+        _promote_best_from_async(eval_dir, ckpt_dir, config, logger)
 
     # Save final
     save_checkpoint(model, str(ckpt_dir / "model_final.pt"),
@@ -433,6 +614,31 @@ def train(config: TrainConfig, logger: Optional[Logger] = None):
     logger.log(f"Training complete. Final model saved to {ckpt_dir / 'model_final.pt'}")
 
     return model
+
+
+def _promote_best_from_async(eval_dir: Path, ckpt_dir: Path,
+                              config: TrainConfig, logger: Logger):
+    """Scan async arena results and promote the best model to model_best.pt."""
+    best_iter = 0
+    best_win_rate = config.win_rate_threshold
+    for result_file in sorted(eval_dir.glob("eval_result_iter*.json")):
+        try:
+            with open(result_file) as f:
+                result = json.load(f)
+            if result.get("arena") and result["arena"]["new_is_better"]:
+                if result["arena"]["new_win_rate"] > best_win_rate:
+                    best_win_rate = result["arena"]["new_win_rate"]
+                    best_iter = result["iter"]
+        except Exception:
+            pass
+    if best_iter > 0:
+        src = ckpt_dir / f"model_iter{best_iter}.pt"
+        dst = ckpt_dir / "model_best.pt"
+        if src.exists():
+            import shutil
+            shutil.copy2(str(src), str(dst))
+            logger.log(f"Promoted model_iter{best_iter}.pt to model_best.pt "
+                       f"(arena win rate {best_win_rate:.1%})")
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +672,8 @@ Examples:
                              'skip Python self-play and train only from this data.')
     parser.add_argument('--data_refresh', action='store_true',
                         help='Re-scan --data_dir every iteration (for ongoing C++ generation)')
+    parser.add_argument('--sync_eval', action='store_true',
+                        help='Disable async eval (run eval synchronously, blocks training)')
     args = parser.parse_args()
 
     config = TrainConfig.from_yaml(args.config)
@@ -477,6 +685,8 @@ Examples:
         config.cpp_data_dir = args.data_dir
     if args.data_refresh:
         config.cpp_data_refresh = True
+    if args.sync_eval:
+        config.async_eval = False
 
     log_dir = Path(config.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
