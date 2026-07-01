@@ -1,0 +1,40 @@
+# YichiAlpha "quick" config — fits in ~3 min on CPU
+# For fast verification that the pipeline learns (not for production).
+
+board_size: 6
+initial_health: 2
+attack_power: 1
+heal_power: 1
+diag_heal: true
+diag_attack: true
+
+in_channels: 11
+channels: 32              # smaller network
+n_blocks: 4               # fewer blocks
+
+n_simulations_train: 40   # very few simulations for speed
+n_simulations_eval: 100
+c_puct: 1.5
+dirichlet_alpha: 0.3
+dirichlet_epsilon: 0.25
+
+iterations: 3
+selfplay_games_per_iter: 2
+train_batches_per_iter: 40
+batch_size: 64
+lr: 0.02                  # higher lr for faster convergence
+weight_decay: 0.0001
+lr_min: 0.0005
+grad_clip: 1.0
+
+buffer_capacity: 10000
+cold_start_random_games: 10  # more random data for cold start
+
+eval_every: 3
+arena_games: 10
+win_rate_threshold: 0.55
+
+checkpoint_dir: "../checkpoints"
+log_dir: "../logs"
+device: "cpu"
+seed: 42

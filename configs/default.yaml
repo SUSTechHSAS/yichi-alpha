@@ -1,0 +1,49 @@
+# YichiAlpha default training config (CPU)
+# ==========================================
+# Designed for CPU verification: small network, few simulations, short training.
+# For GPU, scale up: n_simulations_train=400, selfplay_games_per_iter=50, etc.
+
+# Game
+board_size: 6
+initial_health: 2
+attack_power: 1
+heal_power: 1
+diag_heal: true
+diag_attack: true
+
+# Network (small for CPU)
+in_channels: 11
+channels: 64
+n_blocks: 6
+
+# MCTS (small for CPU speed)
+n_simulations_train: 80
+n_simulations_eval: 200
+c_puct: 1.5
+dirichlet_alpha: 0.3
+dirichlet_epsilon: 0.25
+
+# Training
+iterations: 5
+selfplay_games_per_iter: 3
+train_batches_per_iter: 30
+batch_size: 64
+lr: 0.01
+weight_decay: 0.0001
+lr_min: 0.0001
+grad_clip: 1.0
+
+# Buffer
+buffer_capacity: 10000
+cold_start_random_games: 8
+
+# Eval
+eval_every: 5
+arena_games: 10
+win_rate_threshold: 0.55
+
+# IO
+checkpoint_dir: "../checkpoints"
+log_dir: "../logs"
+device: "cpu"
+seed: 42

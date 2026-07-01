@@ -1,0 +1,37 @@
+# Build artifacts
+engine/build/
+build/
+*.o
+*.so
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs and runtime
+logs/
+*.log
+*.jsonl
+
+# Checkpoints (keep small demo ones, ignore cpp-format)
+checkpoints/*_cpp.pt
+checkpoints/model_best.pt
+checkpoints/model_final.pt
+
+# Generated self-play data
+selfplay_data/
+/tmp/
+
+# OS files
+Thumbs.db
