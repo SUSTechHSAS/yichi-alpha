@@ -39,139 +39,40 @@ from evaluate import RandomAgent
 
 
 # ---------------------------------------------------------------------------
-# Display — clean single-char cells, matching the original web game style
+# Display — exactly mirrors yichiqi_az/play.py show() function
 # ---------------------------------------------------------------------------
-# Style borrowed from yichiqi_az/play.py:
-#   - Row labels: A, B, C, ... (letters)
-#   - Column labels: 1, 2, 3, ... (numbers)
-#   - Each cell is a single char: x / o / # / .
-#   - Coordinate input: "C3" = row C, column 3
+# Single-char cells, no color, no health, no borders. Just clean ASCII.
+#   Row labels: A, B, C, ... (letters)
+#   Column labels: 1, 2, 3, ... (numbers)
+#   Coordinate: "C3" = row C, column 3
 #
-# Enhancements over the original:
-#   - ANSI colors (orange X, blue O, gray blocks) matching the web CSS
-#   - Health shown as superscript next to the piece (x² o⁹)
-#   - Last move highlighted with brackets [x²]
-#   - Disable color with --no-color or NO_COLOR env var
+# Example output:
+#    1 2 3 4 5
+#   A . . . . .
+#   B . . x . .
+#   C . . . . .
+#   D . . . . .
+#   E . . . . .
+#      x=1  o=0   turn=o
 
-# ANSI color codes (matching original web CSS: #ff4500 orange, #00bfff blue)
-COLOR_RESET = "\033[0m"
-COLOR_X = "\033[38;5;202m"   # bright orange (close to #ff4500)
-COLOR_O = "\033[38;5;39m"    # bright blue (close to #00bfff)
-COLOR_BLOCK = "\033[38;5;244m"  # gray (#777777)
-COLOR_DIM = "\033[38;5;240m"    # dim gray for empty/borders
-COLOR_BOLD = "\033[1m"
-COLOR_LAST = "\033[48;5;238m"   # dark bg highlight for last move
-
-# Superscript digits for health (keeps cell width = 1 char)
-SUPERSCRIPT = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
-
-PLAYER_LABEL = {X: 'X (橙)', O: 'O (蓝)'}
-PLAYER_SHORT = {X: 'X', O: 'O'}
-
-
-def _use_color():
-    """Check if color output is enabled."""
-    import os
-    return not bool(os.environ.get('NO_COLOR')) and sys.stdout.isatty()
-
-
-def _visible_len(s: str) -> int:
-    """Length of string excluding ANSI escape codes."""
-    import re
-    # Remove ANSI escape sequences: \033[...m
-    clean = re.sub(r'\033\[[0-9;]*m', '', s)
-    return len(clean)
-
-
-def _render_cell_char(t: int, h: int, is_last: bool, use_color: bool) -> str:
-    """Render one cell as a colored string (piece char + optional superscript health).
-
-    Returns string with visible width:
-      - empty/block: 1 char
-      - piece: 2 chars (char + superscript health)
-      - last move piece: 4 chars ([char + health])
-    Caller pads to consistent width.
-    """
-    if t == X:
-        ch = "x"
-        health = str(h).translate(SUPERSCRIPT)
-        s = f"{ch}{health}"
-        if use_color:
-            s = f"{COLOR_X}{s}{COLOR_RESET}"
-        if is_last:
-            s = f"[{s}]" if not use_color else f"{COLOR_BOLD}[{s}]{COLOR_RESET}"
-        return s
-    elif t == O:
-        ch = "o"
-        health = str(h).translate(SUPERSCRIPT)
-        s = f"{ch}{health}"
-        if use_color:
-            s = f"{COLOR_O}{s}{COLOR_RESET}"
-        if is_last:
-            s = f"[{s}]" if not use_color else f"{COLOR_BOLD}[{s}]{COLOR_RESET}"
-        return s
-    elif t == BLOCK:
-        s = "#"
-        if use_color:
-            s = f"{COLOR_BLOCK}{s}{COLOR_RESET}"
-        return s
-    else:
-        return "·" if not use_color else f"{COLOR_DIM}·{COLOR_RESET}"
+SYM = {X: "x", O: "o", BLOCK: "#", EMPTY: "."}
+PLAYER_LABEL = {X: 'X', O: 'O'}
 
 
 def render_board(state: GameState, last_move=None, show_coords: bool = True):
-    """Render the board in clean single-char style (like yichiqi_az but colored).
-
-    Row labels: A, B, C, ... (top to bottom)
-    Column labels: 1, 2, 3, ... (left to right)
-    Coordinate: "C3" = row C, column 3
-    """
-    n = state.board_size
-    use_color = _use_color()
-    print()
-
-    # Column header: each number centered over its 3-char cell
-    col_nums = "  ".join(str(c + 1) for c in range(n))
-    if use_color:
-        print(f"    {COLOR_DIM}{col_nums}{COLOR_RESET}")
-    else:
-        print(f"    {col_nums}")
-
-    for r in range(n):
-        row_letter = chr(ord('A') + r)
-        cells = []
-        for c in range(n):
-            t = int(state.types[r, c])
-            h = int(state.health[r, c])
-            is_last = (last_move is not None and r == last_move[0] and c == last_move[1])
-            cell_str = _render_cell_char(t, h, is_last, use_color)
-            # Pad to consistent visible width of 3 chars
-            # (pieces x² = 2 chars; empty/block = 1 char; last move [x⁴] = 4 → use 3 + allow overflow)
-            vl = _visible_len(cell_str)
-            if vl >= 3:
-                # last move with brackets is 4 chars, that's fine — it stands out
-                cells.append(cell_str)
-            else:
-                pad = 3 - vl
-                # center: put extra space on right
-                cells.append(cell_str + " " * pad)
-        row_label = row_letter
-        if use_color:
-            row_label = f"{COLOR_BOLD}{row_letter}{COLOR_RESET}"
-        print(f"  {row_label} " + " ".join(cells))
-
-    print()
+    """Render the board — identical style to yichiqi_az/play.py show()."""
+    N = state.board_size
+    # Column header
+    print("   " + " ".join(str(c + 1) for c in range(N)))
+    # Each row: letter + cells
+    for r in range(N):
+        row = [SYM[int(state.types[r, c])] for c in range(N)]
+        print(chr(ord('A') + r) + "  " + " ".join(row))
     # Status line
-    x_count = int((state.types == X).sum())
-    o_count = int((state.types == O).sum())
-    turn = PLAYER_LABEL[state.current_player]
-    if use_color:
-        turn_color = COLOR_X if state.current_player == X else COLOR_O
-        turn = f"{turn_color}{turn}{COLOR_RESET}"
-    print(f"  轮到: {turn}   步数: {state.step}   棋子: X={x_count} O={o_count}")
-    if last_move:
-        coord = f"{chr(ord('A') + last_move[0])}{last_move[1]+1}"
-        print(f"  上一步: {coord}")
+    xc = int((state.types == X).sum())
+    oc = int((state.types == O).sum())
+    turn = 'x' if state.current_player == X else 'o'
+    print(f"   x={xc}  o={oc}   turn={turn}")
     print()
 
 
@@ -261,8 +162,8 @@ def play_game(args):
     print("=" * 50)
     print(f"  异吃棋 — 人机对战")
     print("=" * 50)
-    print(f"  你:    {PLAYER_LABEL[human_side]}")
-    print(f"  AI:    {PLAYER_LABEL[ai_side]}")
+    print(f"  你:    {'x' if human_side == X else 'o'}")
+    print(f"  AI:    {'x' if ai_side == X else 'o'}")
     print(f"  棋盘:  {args.board_size}×{args.board_size}")
     if args.random:
         print(f"  AI 策略: 随机 (最弱)")
@@ -288,15 +189,15 @@ def play_game(args):
 
     # Game loop
     while not state.is_terminal():
-        render_board(state, last_move=last_move, show_coords=not args.no_coords)
-        last_move = None  # only highlight once
+        render_board(state)
+        last_move = None
 
         current = state.current_player
         if current == human_side:
             # Human turn
             while True:
                 try:
-                    user_input = input(f"  你的回合 ({PLAYER_SHORT[human_side]}) — 输入坐标 (如 C3): ").strip()
+                    user_input = input(f"  your move (e.g. C3): ").strip()
                 except (EOFError, KeyboardInterrupt):
                     print("\n退出游戏。")
                     return
@@ -338,7 +239,7 @@ def play_game(args):
                 break
         else:
             # AI turn
-            print(f"\n  AI 回合 ({PLAYER_SHORT[ai_side]})...")
+            print(f"\n  AI turn ({'x' if ai_side == X else 'o'})...")
             move = ai_agent.select_move(state)
             if move is None:
                 print("  AI 无合法落子，游戏结束。")
@@ -349,7 +250,7 @@ def play_game(args):
             print(f"  AI 落子: {chr(ord('A') + move[0])}{move[1]+1}")
 
     # Game over
-    render_board(state, last_move=last_move, show_coords=not args.no_coords)
+    render_board(state)
     x_count = int((state.types == X).sum())
     o_count = int((state.types == O).sum())
     winner = state.winner()
@@ -397,16 +298,9 @@ def main():
                         help='AI 用随机策略 (不用模型)')
     parser.add_argument('--no-thinking', action='store_true',
                         help='不显示 AI 思考过程')
-    parser.add_argument('--no-coords', action='store_true',
-                        help='不显示空格上的坐标提示 (更简洁的棋盘)')
-    parser.add_argument('--no-color', action='store_true',
-                        help='禁用 ANSI 颜色 (适合不支持颜色的终端或日志)')
     args = parser.parse_args()
 
     args.show_thinking = not args.no_thinking
-    if args.no_color:
-        import os
-        os.environ['NO_COLOR'] = '1'
 
     if not args.random and not Path(args.checkpoint).exists():
         print(f"错误: 模型文件不存在: {args.checkpoint}")
